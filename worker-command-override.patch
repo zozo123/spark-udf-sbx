@@ -1,0 +1,15 @@
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/externalUDF/PlanExternalUDFsSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/externalUDF/PlanExternalUDFsSuite.scala
+index 004ec313..27d9e9d3 100644
+--- a/sql/core/src/test/scala/org/apache/spark/sql/execution/externalUDF/PlanExternalUDFsSuite.scala
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/externalUDF/PlanExternalUDFsSuite.scala
+@@ -736,6 +736,10 @@ class PlanExternalUDFsSuite extends QueryTest with SharedSparkSession {
+       .addCommand("-cp")
+       .addCommand(System.getProperty("java.class.path"))
+       .addCommand(classOf[EchoGrpcWorkerMain.type].getName.stripSuffix("$"))
++    sys.env.get("SBX_PROOF_COMMAND_FILE").foreach { file =>
++      runner.clearCommand()
++      java.nio.file.Files.readAllLines(Paths.get(file)).forEach(c => runner.addCommand(c))
++    }
+     val spec = UDFWorkerSpecification.newBuilder()
+       .setEnvironment(WorkerEnvironment.newBuilder())
+       .setCapabilities(WorkerCapabilities.newBuilder()
