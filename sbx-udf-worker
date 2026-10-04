@@ -3,12 +3,15 @@
 
 Usage, as the worker command Spark spawns:
 
-  sbx-udf-worker --sandbox NAME -- GUEST_COMMAND... --id ID --connection HOST_SOCKET
+  sbx-udf-worker --sandbox NAME [options] -- GUEST_COMMAND... --id ID --connection HOST_SOCKET
 
-Spark appends --id and --connection. The guest worker binds its own socket in
-the sandbox because a guest socket on a shared mount is not connectable from
-the host. This process binds HOST_SOCKET and copies bytes for each connection
-through `sbx exec -i`.
+Spark appends --id and --connection. A socket bound inside the sandbox belongs
+to the guest kernel, so this process binds HOST_SOCKET itself and copies bytes
+for each connection through `sbx exec -i`.
+
+A guest supervisor runs the worker in its own process group. It stops that
+group when its stdin closes, which happens on SIGTERM and also when this
+process is SIGKILLed, so the guest worker never outlives the launcher.
 """
 
 import argparse
@@ -18,22 +21,60 @@ import socket
 import subprocess
 import sys
 import threading
-import time
+
+SUPERVISOR = r"""
+import os, signal, stat, subprocess, sys, threading, time
+sock, grace, timeout = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+os.makedirs(os.path.dirname(sock), exist_ok=True)
+try:
+    os.unlink(sock)
+except FileNotFoundError:
+    pass
+worker = subprocess.Popen(sys.argv[4:], start_new_session=True,
+                          stdin=subprocess.DEVNULL, stdout=2)
+def kill_group(sig):
+    try:
+        os.killpg(worker.pid, sig)
+    except ProcessLookupError:
+        pass
+def stop_on_eof():
+    while os.read(0, 4096):
+        pass
+    kill_group(signal.SIGTERM)
+    try:
+        worker.wait(grace)
+    except subprocess.TimeoutExpired:
+        kill_group(signal.SIGKILL)
+threading.Thread(target=stop_on_eof, daemon=True).start()
+def is_socket():
+    try:
+        return stat.S_ISSOCK(os.stat(sock).st_mode)
+    except FileNotFoundError:
+        return False
+deadline = time.monotonic() + timeout
+while not is_socket():
+    if worker.poll() is not None:
+        break
+    if time.monotonic() > deadline:
+        kill_group(signal.SIGKILL)
+        worker.wait()
+        sys.exit(124)
+    time.sleep(0.05)
+else:
+    os.write(1, b"ready\n")
+code = worker.wait()
+kill_group(signal.SIGKILL)
+try:
+    os.unlink(sock)
+except FileNotFoundError:
+    pass
+sys.exit(code if code >= 0 else 128 - code)
+"""
 
 BRIDGE = r"""
-import os, socket, sys, threading, time
-path = sys.argv[1]
-deadline = time.monotonic() + 30
-while True:
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.connect(path)
-        break
-    except OSError:
-        s.close()
-        if time.monotonic() > deadline:
-            raise
-        time.sleep(0.05)
+import os, socket, sys, threading
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
 def pump_in():
     while True:
         data = os.read(0, 65536)
@@ -59,6 +100,9 @@ def parse(argv):
     parser.add_argument("--sbx", default="sbx")
     parser.add_argument("--guest-dir", default="/tmp/sbx-udf-workers")
     parser.add_argument("--ready-timeout", type=float, default=60.0)
+    parser.add_argument("--grace-period", type=float, default=5.0)
+    parser.add_argument("-e", "--env", action="append", default=[],
+                        help="forward this host environment variable to the guest")
     parser.add_argument("--log")
     opts = parser.parse_args(argv[:split])
     guest = argv[split + 1:]
@@ -84,55 +128,70 @@ def parse(argv):
 
 def main():
     opts, command, worker_id, host_socket = parse(sys.argv[1:])
-    sbx = [opts.sbx, "exec"]
+    exec_args = [opts.sbx, "exec", "-i"]
+    for name in opts.env:
+        if name in os.environ:
+            exec_args += ["-e", f"{name}={os.environ[name]}"]
+    exec_args.append(opts.sandbox)
     guest_socket = f"{opts.guest_dir}/{worker_id}.sock"
-    pid_file = f"{opts.guest_dir}/{worker_id}.pid"
+    log = open(opts.log, "a", buffering=1) if opts.log else sys.stderr
     stopping = threading.Event()
     bridges = []
-    log = open(opts.log, "a", buffering=1) if opts.log else sys.stderr
 
     def trace(message):
         print(f"[sbx-udf-worker {worker_id}] {message}", file=log, flush=True)
 
     trace(f"host={host_socket} guest={opts.sandbox}:{guest_socket}")
-    worker = subprocess.Popen(
-        sbx + [opts.sandbox, "sh", "-c",
-               'mkdir -p "$1" && echo $$ > "$2" && uname -sm >&2 && shift 2 && exec "$@"',
-               "sh", opts.guest_dir, pid_file] + command + ["--connection", guest_socket],
-        stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-    )
+    supervisor = subprocess.Popen(
+        exec_args + ["python3", "-u", "-c", SUPERVISOR, guest_socket,
+                     str(opts.grace_period), str(opts.ready_timeout)]
+        + command + ["--connection", guest_socket],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
 
-    def stop(*_):
-        if stopping.is_set():
-            return
-        stopping.set()
-        trace("stopping")
-        subprocess.run(
-            sbx + [opts.sandbox, "sh", "-c",
-                   'kill -TERM "$(cat "$1")" 2>/dev/null; rm -f "$1"', "sh", pid_file],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            worker.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            worker.kill()
+    def finish(code):
         for bridge in bridges:
             bridge.kill()
         try:
             os.unlink(host_socket)
         except FileNotFoundError:
             pass
-        os._exit(0)
+        os._exit(code)
+
+    def stop(*_):
+        if stopping.is_set():
+            return
+        stopping.set()
+        trace("stopping")
+        supervisor.stdin.close()
+        try:
+            supervisor.wait(timeout=opts.grace_period + 5)
+        except subprocess.TimeoutExpired:
+            supervisor.kill()
+        finish(0)
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    deadline = time.monotonic() + opts.ready_timeout
-    while subprocess.run(sbx + [opts.sandbox, "test", "-S", guest_socket]).returncode != 0:
-        if worker.poll() is not None:
-            sys.exit(f"sbx-udf-worker: guest worker exited with {worker.returncode}")
-        if time.monotonic() > deadline:
-            stop()
-        time.sleep(0.1)
+    first_line = []
+    answered = threading.Event()
+
+    def read_ready():
+        first_line.append(supervisor.stdout.readline())
+        answered.set()
+
+    threading.Thread(target=read_ready, daemon=True).start()
+    if not answered.wait(opts.ready_timeout + 10):
+        trace("guest worker did not become ready")
+        supervisor.stdin.close()
+        try:
+            supervisor.wait(timeout=opts.grace_period + 5)
+        except subprocess.TimeoutExpired:
+            supervisor.kill()
+        finish(1)
+    if first_line[0] != b"ready\n":
+        code = supervisor.wait()
+        trace(f"guest worker exited with {code} before ready")
+        finish(code or 1)
 
     try:
         os.unlink(host_socket)
@@ -140,24 +199,29 @@ def main():
         pass
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(host_socket)
-    server.listen(16)
+    server.listen(socket.SOMAXCONN)
     trace("ready")
 
     def relay(client):
-        trace("connection")
         bridge = subprocess.Popen(
-            sbx + ["-i", opts.sandbox, "python3", "-u", "-c", BRIDGE, guest_socket],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            exec_args + ["python3", "-u", "-c", BRIDGE, guest_socket],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
         bridges.append(bridge)
 
         def to_guest():
-            while True:
-                data = client.recv(65536)
-                if not data:
-                    bridge.stdin.close()
-                    return
-                bridge.stdin.write(data)
-                bridge.stdin.flush()
+            try:
+                while True:
+                    data = client.recv(65536)
+                    if not data:
+                        break
+                    bridge.stdin.write(data)
+                    bridge.stdin.flush()
+            except OSError:
+                pass
+            try:
+                bridge.stdin.close()
+            except OSError:
+                pass
 
         threading.Thread(target=to_guest, daemon=True).start()
         fd = bridge.stdout.fileno()
@@ -170,13 +234,16 @@ def main():
         except OSError:
             pass
         client.close()
+        bridge.wait()
+        bridges.remove(bridge)
 
-    def watch_worker():
-        code = worker.wait()
+    def watch_supervisor():
+        code = supervisor.wait()
         if not stopping.is_set():
-            os._exit(code)
+            trace(f"guest worker exited with {code}")
+            finish(code or 1)
 
-    threading.Thread(target=watch_worker, daemon=True).start()
+    threading.Thread(target=watch_supervisor, daemon=True).start()
     while True:
         client, _ = server.accept()
         threading.Thread(target=relay, args=(client,), daemon=True).start()
